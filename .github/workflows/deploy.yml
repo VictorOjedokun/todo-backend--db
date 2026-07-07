@@ -16,7 +16,7 @@
 #
 # =============================================================================
 
-name: Deploy Backend
+name: Deploy Backend To GCP
 
 on:
   push:
