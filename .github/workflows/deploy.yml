@@ -1,0 +1,89 @@
+# =============================================================================
+# Backend CI/CD Pipeline — Node.js/Express + Cloud SQL (MySQL)
+# Place at: .github/workflows/deploy.yml in your backend repo
+# =============================================================================
+#
+# Required GitHub Secrets (Settings → Secrets → Actions):
+#   BACKEND_VM_HOST   — GCP VM public IP or hostname
+#   BACKEND_VM_USER   — SSH user (your VM login username)
+#   BACKEND_VM_SSH_KEY — Private SSH key (contents of id_rsa, no passphrase)
+#   DB_HOST           — Cloud SQL instance public IP
+#   DB_USER           — MySQL user (e.g. todo_user)
+#   DB_PASSWORD       — MySQL user password
+#   DB_NAME           — MySQL database name (e.g. tododb)
+#   DB_PORT           — MySQL port (almost always 3306)
+#   FRONTEND_URL      — Frontend VM public IP (for CORS)
+#
+# =============================================================================
+
+name: Deploy Backend
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test --if-present
+
+      - name: Lint
+        run: npm run lint --if-present
+
+  deploy:
+    name: Deploy to GCP VM
+    runs-on: ubuntu-latest
+    needs: test
+    environment: production
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.BACKEND_VM_HOST }}
+          username: ${{ secrets.BACKEND_VM_USER }}
+          key: ${{ secrets.BACKEND_VM_SSH_KEY }}
+          script: |
+            set -e
+
+            APP_DIR="/var/www/backend"
+            cd "$APP_DIR"
+
+            echo "==> Pulling latest code..."
+            git fetch origin master
+            git reset --hard origin/master
+
+            echo "==> Installing production dependencies..."
+            npm ci --production
+
+            echo "==> Injecting DB environment variables..."
+            export DB_HOST="${{ secrets.DB_HOST }}"
+            export DB_PORT="${{ secrets.DB_PORT }}"
+            export DB_USER="${{ secrets.DB_USER }}"
+            export DB_PASSWORD="${{ secrets.DB_PASSWORD }}"
+            export DB_NAME="${{ secrets.DB_NAME }}"
+            export FRONTEND_URL="${{ secrets.FRONTEND_URL }}"
+
+            echo "==> Restarting app via PM2..."
+            pm2 reload backend --update-env || pm2 start ecosystem.config.js
+
+            echo "==> Checking app status..."
+            pm2 show backend
+
+            echo "✅ Backend deployment complete"

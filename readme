@@ -1,0 +1,108 @@
+# Deploying a Two-Repo App to Two GCP VMs (Backend + Frontend) with CI/CD
+
+This is a real walkthrough of deploying a Node.js/Express backend and a Create React App frontend to two separate GCP VMs, connected to each other, with GitHub Actions handling automatic deployments on every push. It includes the actual mistakes made along the way and how they were fixed — debugging is part of the job, not a sign something went wrong.
+
+## Architecture
+
+```
+GitHub (todo-backend repo)  ──push──▶  GitHub Actions  ──SSH──▶  Backend VM (Nginx → PM2 → Express, port 80 → 3000)
+GitHub (todo-frontend repo) ──push──▶  GitHub Actions  ──SSH──▶  Frontend VM (Nginx → PM2 → serve, port 80 → 3001)
+
+Frontend VM (browser) ──fetch──▶ Backend VM, over the public internet, via REACT_APP_API_URL
+```
+
+Two completely separate VMs, two separate repos, two separate pipelines. The frontend talks to the backend the same way any browser would — over HTTP, using the backend's public IP.
+
+
+
+## Step 1: Set Up the CI/CD Pipeline (GitHub Actions)
+
+Add the deploy workflow file to each repo at `.github/workflows/deploy.yml` — one file per repo (`backend-deploy.yml` content goes in the backend repo, `frontend-deploy.yml` content goes in the frontend repo).
+
+### How it works
+
+1. Code is pushed to GitHub
+2. GitHub Actions checks out the code and runs it through a build/test step on GitHub's own servers
+3. If that succeeds, GitHub Actions opens an SSH connection to the VM
+4. On the VM, it pulls the latest code, reinstalls dependencies, rebuilds, and restarts the app under PM2
+
+
+
+## Step 2: Create the VMs and Connect via SSH
+
+Spin up two VMs (one for backend, one for frontend) on your cloud provider (GCP or Azure both work the same way at the OS level). Note the public IP address of each VM, since you'll need it in several places later.
+
+SSH into each VM to confirm access before doing anything else:
+
+```bash
+ssh <your-username>@<vm-public-ip>
+```
+
+If this connects successfully, you're ready to provision. If it doesn't, fix that first — nothing else in this guide will work without SSH access.
+
+## Step 4: Run the Provisioning Script
+
+Copy `provision-backend.sh` onto the backend VM and `provision-frontend.sh` onto the frontend VM (e.g. via `scp`, or by creating the file directly on the VM and pasting the contents in).
+
+### Where to edit the scripts before running them
+
+Both scripts have a config block near the top — **this is the only part you should need to change**:
+
+```bash
+# ---------- Config — edit these before running ----------
+APP_USER="your-vm-username"
+APP_DIR="/var/www/backend"          # or /var/www/frontend
+REPO_URL="https://github.com/YOUR_ORG/YOUR_REPO.git"
+REPO_BRANCH="main"                  # or master, check your repo
+APP_PORT=3000                       # 3001 for frontend
+NGINX_SERVER_NAME="your-vm-ip"
+NODE_VERSION="20"
+# --------------------------------------------------------
+```
+
+The frontend script has one extra variable, `BACKEND_API_URL`, which should point at the backend VM's IP **including the `/api` prefix** if your backend routes are mounted under `/api` — e.g. `http://34.35.151.43/api`.
+
+Once edited, run each script with `sudo` (it needs root to install packages, configure Nginx, and set up the firewall):
+
+```bash
+sudo bash provision-backend.sh
+```
+
+```bash
+sudo bash provision-frontend.sh
+```
+
+### What the script does, step by step
+
+1. Updates the system and installs `git`, `nginx`, `build-essential`, `ufw`
+2. Installs Node.js (via NodeSource) and PM2 (a process manager that keeps your app running and restarts it if it crashes)
+3. Clones the repo into `/var/www/backend` or `/var/www/frontend`
+4. Installs dependencies and builds the app
+5. Starts the app under PM2, configured to launch automatically on VM reboot
+6. Configures Nginx as a reverse proxy, so the app (running on an internal port like 3000) is reachable on the standard web port 80
+7. Opens the firewall for SSH and HTTP traffic
+
+
+
+## Step 4: Add GitHub Secrets
+
+Back in each repo on GitHub, go to **Settings → Secrets and variables → Actions** and add the secrets the pipeline needs. Never hardcode these values into the workflow file itself.
+
+**Backend repo:**
+
+| Secret | What it is |
+|---|---|
+| `BACKEND_VM_HOST` | The backend VM's public IP |
+| `BACKEND_VM_USER` | The SSH username on the VM |
+| `BACKEND_VM_SSH_KEY` | A private SSH key that can log into that user on the VM |
+
+**Frontend repo:**
+
+| Secret | What it is |
+|---|---|
+| `FRONTEND_VM_HOST` | The frontend VM's public IP |
+| `FRONTEND_VM_USER` | The SSH username on the VM |
+| `FRONTEND_VM_SSH_KEY` | A private SSH key that can log into that user on the VM |
+| `REACT_APP_API_URL` | The backend's URL, baked into the frontend build (include `/api` if your backend routes use that prefix) |
+
+Once these are filled in, push any commit to trigger the pipeline — from this point forward, every push redeploys automatically.
