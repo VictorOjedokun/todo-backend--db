@@ -18,10 +18,10 @@ export DEBIAN_FRONTEND=noninteractive
 # ---------- Config — edit these before running ----------
 APP_USER="xahavi"   # <-- your VM login username
 APP_DIR="/var/www/backend"
-REPO_URL="https://github.com/VictorOjedokun/todo-backend.git"
+REPO_URL="https://github.com/VictorOjedokun/todo-backend--db.git"
 REPO_BRANCH="master"
 APP_PORT=3000
-NGINX_SERVER_NAME="34.35.151.43"   # or VM public IP
+NGINX_SERVER_NAME="34.35.187.143"   # or VM public IP
 NODE_VERSION="20"
 # --------------------------------------------------------
 
