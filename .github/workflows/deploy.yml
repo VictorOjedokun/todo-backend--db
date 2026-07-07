@@ -16,7 +16,7 @@
 #
 # =============================================================================
 
-name: Deploy Backend To GCP VM
+name: Deploy Backend
 
 on:
   push:
@@ -72,13 +72,31 @@ jobs:
             echo "==> Installing production dependencies..."
             npm ci --production
 
-            echo "==> Injecting DB environment variables..."
-            export DB_HOST="${{ secrets.DB_HOST }}"
-            export DB_PORT="${{ secrets.DB_PORT }}"
-            export DB_USER="${{ secrets.DB_USER }}"
-            export DB_PASSWORD="${{ secrets.DB_PASSWORD }}"
-            export DB_NAME="${{ secrets.DB_NAME }}"
-            export FRONTEND_URL="${{ secrets.FRONTEND_URL }}"
+            echo "==> Writing ecosystem.config.js with real credentials..."
+            cat > "$APP_DIR/ecosystem.config.js" <<'ECOSYSTEM'
+            module.exports = {
+              apps: [{
+                name: 'backend',
+                script: './src/index.js',
+                instances: 1,
+                autorestart: true,
+                watch: false,
+                env: {
+                  NODE_ENV:     'production',
+                  PORT:         3000,
+                  FRONTEND_URL: '${{ secrets.FRONTEND_URL }}',
+                  DB_HOST:      '${{ secrets.DB_HOST }}',
+                  DB_PORT:      '${{ secrets.DB_PORT }}',
+                  DB_USER:      '${{ secrets.DB_USER }}',
+                  DB_PASSWORD:  '${{ secrets.DB_PASSWORD }}',
+                  DB_NAME:      '${{ secrets.DB_NAME }}',
+                }
+              }]
+            };
+            ECOSYSTEM
+
+            echo "==> Killing any stale process on port 3000..."
+            sudo fuser -k 3000/tcp 2>/dev/null || true
 
             echo "==> Restarting app via PM2..."
             pm2 reload backend --update-env || pm2 start ecosystem.config.js
