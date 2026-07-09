@@ -16,7 +16,7 @@
 #
 # =============================================================================
 
-name: Deploy Backend to VM
+name: Deploy Backend
 
 on:
   push:
