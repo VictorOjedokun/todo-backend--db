@@ -1,315 +1,211 @@
-# Backend VM Setup — Step by Step
+# Adding a Database — GCP Cloud SQL (MySQL)
 
-This guide walks through every command needed to set up the backend VM manually. Each command is explained so you know exactly what it does and why before you run it. All commands are run on the **backend VM** over SSH unless stated otherwise.
+This guide walks through creating a managed MySQL database on GCP Cloud SQL and wiring it into the backend Express app and CI/CD pipeline. No new VM needed — GCP hosts and manages the database for you.
 
-**VM details:**
-- Public IP: `YOUR_BACKEND_VM_IP`
-- OS: Ubuntu 22.04 (Azure)
-- Login user: `your-azure-username`
-- App: Node.js/Express backend serving `/api/todos` on port 3000
+> **Note:** The backend code (`src/db.js`, updated `src/index.js`, `mysql2` dependency) is already updated before this guide begins. This guide covers only the infrastructure setup, database creation, and CI/CD wiring.
 
 ---
 
-## Before You Start
+## Important: Two Names, Don't Confuse Them
 
-Open VS Code, install the **Remote - SSH** extension if you haven't already, then connect to your backend VM:
+GCP Cloud SQL has two completely separate names that look similar but mean different things:
 
-1. Press `Ctrl + Shift + P` → type **Remote-SSH: Connect to Host** → Enter
-2. Type `your-azure-username@YOUR_BACKEND_VM_IP` → Enter
-3. VS Code will open a new window connected to the VM. Open the integrated terminal with `` Ctrl + ` ``
+| Name | What it is | Example |
+|---|---|---|
+| **Instance ID** | The name of the Cloud SQL server in GCP | `todo-db` |
+| **Database name** | The actual MySQL database created inside that server | `tododb` |
 
-Once in the terminal, switch to root so you don't need to type `sudo` in front of every command:
-
-```bash
-sudo -i
-```
-
-> **Why root?** Most of what follows (installing packages, creating directories in `/var/www`, configuring Nginx, editing firewall rules) requires root permissions. It's cleaner to switch once than to prefix every command with `sudo`.
+`DB_NAME` in your config and GitHub Secrets must be the **database name** (`tododb`), not the instance ID (`todo-db`). This is the single most common mistake — confusing the two causes an `Access denied` error even when credentials are correct.
 
 ---
 
-## Step 1 — Update the system and install required packages
+## What Changes
 
-**Refresh the package list:**
-```bash
-apt-get update -y
+```
+Before:
+  Browser → Frontend VM → Backend VM (todos stored in memory, lost on restart)
+
+After:
+  Browser → Frontend VM → Backend VM → Cloud SQL (MySQL)
+                                        (managed by GCP, data persists)
 ```
 
-> Downloads the latest list of available packages from Ubuntu's repositories. Nothing is installed yet — this just updates the index.
-
-**Upgrade installed packages:**
-```bash
-apt-get -o Dpkg::Options::="--force-confold" upgrade -y --no-install-recommends
-```
-
-> Upgrades everything currently installed to its latest version. `--force-confold` automatically keeps existing config files if a package tries to replace them (avoids another interactive prompt). `--no-install-recommends` skips optional packages to keep the system lean.
-
-**Install the tools we need:**
-```bash
-apt-get install -y git curl build-essential nginx ufw
-```
-
-> - `git` — for cloning the repo and pulling updates during deploys
-> - `curl` — used in the next step to download the Node.js installer
-> - `build-essential` — C compiler toolchain, required by some npm packages that compile native code
-> - `nginx` — the web server / reverse proxy that will sit in front of your Express app
-> - `ufw` — Uncomplicated Firewall, used to open/close ports on the VM
+The `ecosystem.config.js` is removed from the repo (the pipeline generates it with real credentials), and six GitHub Secrets are added for the DB credentials.
 
 ---
 
-## Step 2 — Install Node.js 20
+## Part 1: Create the Cloud SQL Instance on GCP
 
-**Download and run the NodeSource setup script:**
-```bash
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-```
+### Step 1 — Open Cloud SQL in the GCP Console
 
-> NodeSource maintains up-to-date Node.js apt packages. This script adds their repository to apt so we can install Node 20 — Ubuntu's default `apt-get install nodejs` would give you a much older version.
+1. Go to [console.cloud.google.com](https://console.cloud.google.com)
+2. In the left menu, navigate to **SQL** (under Databases)
+3. Click **Create Instance**
 
-**Install Node.js:**
-```bash
-apt-get install -y nodejs
-```
+### Step 2 — Configure the instance
 
-**Confirm both Node and npm are installed:**
-```bash
-node -v && npm -v
-```
+Select **MySQL**, then fill in:
 
-> You should see something like `v20.x.x` and `10.x.x`. If either command fails, the install didn't complete — re-run the two steps above.
+| Setting | Value |
+|---|---|
+| Database version | **MySQL 8.4** (latest) |
+| Instance ID | `todo-db` (this is just the GCP server name, not your DB name) |
+| Password | Set a strong root password — save this somewhere safe |
+| Region | Same region as your backend VM (e.g. `africa-south1`) |
+| Zone | Any |
+| Machine type | **Sandbox** (cheapest, fine for class projects) |
+| Storage | 10 GB SSD (default is fine) |
 
----
+Click **Create Instance** — this takes 3–5 minutes to provision.
 
-## Step 3 — Install PM2
+### Step 3 — Allow your backend VM to connect
 
-```bash
-npm install -g pm2
-```
+By default Cloud SQL blocks all incoming connections. You need to add your backend VM's public IP as an authorised network.
 
-> Installs PM2 globally (the `-g` flag). PM2 is a process manager for Node.js apps — it keeps your Express server running in the background, restarts it if it crashes, and can start it automatically when the VM reboots. Think of it as a supervisor for your app.
+1. In Cloud SQL, click your instance → **Connections** tab → **Networking**
+2. Under **Authorised networks**, click **Add network**
+3. Enter your backend VM's public IP with `/32` at the end (e.g. `34.35.151.43/32`)
+4. Name it `backend-vm` so you remember what it is
+5. Click **Save**
 
----
+> **Why /32?** CIDR notation — `/32` means exactly one IP address. `/0` would mean the entire internet, which you never want for a database.
 
-## Step 4 — Create the app directory and set ownership
+### Step 4 — Note the Cloud SQL public IP
 
-**Create the directory where the app will live:**
-```bash
-mkdir -p /var/www/backend
-```
-
-> `/var/www/` is the standard location for web application files on Linux. The `-p` flag creates parent directories if they don't already exist.
-
-**Give your login user ownership of that directory:**
-```bash
-chown your-azure-username:your-azure-username /var/www/backend
-```
-
-> By default, directories created by root are owned by root. Your login user (`your-azure-username`) needs to own this directory so it can write files there — including during CI/CD deploys that SSH in as `your-azure-username`, not root.
+On the instance overview page, copy the **Public IP address** — you'll need this as `DB_HOST` in GitHub Secrets later. This is different from the instance ID (`todo-db`).
 
 ---
 
-## Step 5 — Clone the repository
+## Part 2: Create the Database and User
+
+We connect to Cloud SQL directly from the **backend VM** — this is the most reliable method since the VM's IP is already whitelisted in the authorised networks list.
+
+### Step 5 — SSH into the backend VM
+
+Connect via VS Code Remote-SSH, then install the MySQL client:
 
 ```bash
-sudo -u your-azure-username git clone --branch master https://github.com/VictorOjedokun/todo-backend.git /var/www/backend
+sudo apt-get install -y default-mysql-client
 ```
 
-> Clones the backend repo into `/var/www/backend`. `sudo -u your-azure-username` runs the command as your login user (not root) so the cloned files are owned by `your-azure-username` rather than root — important for file permission consistency later.
-
----
-
-## Step 6 — Install dependencies
+### Step 6 — Connect to Cloud SQL
 
 ```bash
-cd /var/www/backend
-sudo -u your-azure-username npm ci --production
+mysql --host=YOUR_CLOUD_SQL_PUBLIC_IP --user=root --password --skip-ssl
 ```
 
-> `npm ci` installs exactly what's in `package-lock.json` — no more, no less. It's faster and more reliable than `npm install` for deployments because it never guesses at versions. `--production` skips `devDependencies` (things like test frameworks and linters that aren't needed at runtime).
+> `--skip-ssl` is required because the MySQL client installed on Ubuntu is MariaDB-based and doesn't support the SSL handshake that MySQL 8.4 expects. The connection still goes over the network securely via GCP's authorised networks restriction.
 
----
+Enter your root password when prompted. You should see the `MySQL [(none)]>` prompt.
 
-## Step 7 — Create the PM2 config file
+### Step 7 — Create the database
 
-```bash
-cat > /var/www/backend/ecosystem.config.js <<'EOF'
-module.exports = {
-  apps: [{
-    name: 'backend',
-    script: './src/index.js',
-    instances: 1,
-    autorestart: true,
-    watch: false,
-    env: {
-      NODE_ENV: 'production',
-      PORT: 3000,
-    }
-  }]
-};
-EOF
+```sql
+CREATE DATABASE tododb CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 ```
 
-> This file tells PM2 everything it needs to know about running your app:
-> - `name: 'backend'` — the name used in `pm2 list`, `pm2 logs backend`, etc.
-> - `script: './src/index.js'` — the entry point of your Express app (update this if your entry point is different, e.g. `./index.js` or `./app.js`)
-> - `autorestart: true` — PM2 restarts the app if it crashes
-> - `watch: false` — don't watch for file changes (that's handled by the CI/CD pipeline instead)
-> - `NODE_ENV: 'production'` and `PORT: 3000` — environment variables passed to the app
 
-**Give ownership of this file to your login user:**
-```bash
-chown your-azure-username:your-azure-username /var/www/backend/ecosystem.config.js
+### Step 8 — Create a dedicated app user
+
+
+
+```sql
+CREATE USER 'todo_user'@'%' IDENTIFIED BY 'your-strong-password-here';
+GRANT SELECT, INSERT, UPDATE, DELETE ON tododb.* TO 'todo_user'@'%';
+FLUSH PRIVILEGES;
+```
+
+> `'%'` means this user can connect from any host. The `GRANT` line gives only the four operations the app actually needs — it cannot drop tables, create users, or do anything destructive.
+
+Verify the user and grants were created correctly:
+
+```sql
+SELECT user, host FROM mysql.user WHERE user = 'todo_user';
+SHOW GRANTS FOR 'todo_user'@'%';
+```
+
+You should see two grant lines: `GRANT USAGE ON *.*` and `GRANT SELECT, INSERT, UPDATE, DELETE ON tododb.*`.
+
+### Step 9 — Create the todos table
+
+```sql
+USE tododb;
+
+CREATE TABLE todos (
+  id          VARCHAR(36)  PRIMARY KEY,
+  title       VARCHAR(255) NOT NULL,
+  completed   TINYINT(1)   NOT NULL DEFAULT 0,
+  created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+
+Optionally seed some initial data:
+
+```sql
+INSERT INTO todos (id, title, completed) VALUES
+  (UUID(), 'Buy groceries', 0),
+  (UUID(), 'Read a book',   1);
+```
+
+Exit the MySQL shell:
+
+```sql
+EXIT;
 ```
 
 ---
 
-## Step 8 — Start the app with PM2
 
-**Start the app:**
-```bash
-sudo -u your-azure-username pm2 start /var/www/backend/ecosystem.config.js
 ```
-
-> Reads `ecosystem.config.js` and starts the Express app as a background process under PM2.
-
-**Save the process list so PM2 knows what to restart on reboot:**
-```bash
-sudo -u your-azure-username pm2 save
-```
-
-> Saves a snapshot of all currently running PM2 processes. This is what PM2 reads on boot to know which apps to start.
-
-**Register PM2 as a systemd service so it starts on VM reboot:**
-```bash
-env PATH=$PATH:/usr/bin pm2 startup systemd -u your-azure-username --hp /home/your-azure-username
-systemctl enable pm2-your-azure-username
-```
-
-> `pm2 startup` generates and installs a systemd unit file that launches PM2 (and therefore your app) automatically whenever the VM reboots. `systemctl enable` makes sure that service is activated.
-
-**Verify the app is running:**
-```bash
-sudo -u your-azure-username pm2 list
-```
-
-> You should see a row for `backend` with status `online`. If it shows `errored`, check the logs with `pm2 logs backend` to see what went wrong — usually a wrong entry point path in `ecosystem.config.js`.
 
 ---
 
-## Step 9 — Allow the user to run PM2 and npm without a password
+## Part 4: Add GitHub Secrets
 
-```bash
-echo "your-azure-username ALL=(ALL) NOPASSWD: /usr/bin/pm2, /usr/bin/npm" > /etc/sudoers.d/app-deploy
-chmod 0440 /etc/sudoers.d/app-deploy
-```
+In your `todo-backend` GitHub repo, go to **Settings → Secrets and variables → Actions** and add these secrets:
 
-> The CI/CD pipeline SSHes in as `your-azure-username` (not root) and needs to run `pm2 reload` and `npm ci` without being prompted for a password — there's no one there to type one. This sudoers rule grants exactly that, scoped only to those two commands, so the user doesn't get blanket root access.
+| Secret | Value | Notes |
+|---|---|---|
+| `DB_HOST` | Cloud SQL public IP | From Step 4 — the IP address, not the instance name |
+| `DB_PORT` | `3306` | MySQL default port |
+| `DB_USER` | `todo_user` | The user created in Step 8 |
+| `DB_PASSWORD` | Your chosen password | The one set in Step 8 |
+| `DB_NAME` | `tododb` | The database name from Step 7 — **not** `todo-db` |
+| `FRONTEND_URL` | `http://YOUR_FRONTEND_VM_IP` | For CORS on the backend |
 
----
+> **Common mistake:** `DB_NAME` must be `tododb` (the MySQL database name you created), not `todo-db` (the GCP Cloud SQL instance ID). They look similar but are completely different things. Getting this wrong causes `Access denied` errors even when the password is correct.
 
-## Step 10 — Configure Nginx as a reverse proxy
-
-**Write the Nginx site config:**
-```bash
-cat > /etc/nginx/sites-available/backend <<'EOF'
-server {
-    listen 80;
-    server_name YOUR_BACKEND_VM_IP;
-
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_cache_bypass $http_upgrade;
-    }
-}
-EOF
-```
-
-> This Nginx config tells the server: "when a request comes in on port 80, forward it to port 3000 on the same machine (where Express is listening)." The `proxy_set_header` lines pass the original request information through so your Express app can see the real client IP and protocol. Your Express app never needs to be exposed to the public internet directly — Nginx handles all incoming traffic.
-
-**Enable the site by creating a symlink:**
-```bash
-ln -sf /etc/nginx/sites-available/backend /etc/nginx/sites-enabled/backend
-```
-
-> Nginx reads config from `/etc/nginx/sites-enabled/`. Rather than copying the file there, we create a symlink pointing to the version in `sites-available/` — standard Ubuntu Nginx practice.
-
-**Remove the default Nginx placeholder site:**
-```bash
-rm -f /etc/nginx/sites-enabled/default
-```
-
-> The default Nginx config serves a placeholder page. If left in place it will conflict with our config (both listening on port 80).
-
-**Test the config and reload Nginx:**
-```bash
-nginx -t && systemctl reload nginx
-```
-
-> `nginx -t` validates the config file for syntax errors before doing anything — if it finds a problem it tells you exactly which line is wrong. `systemctl reload nginx` applies the new config without dropping existing connections (unlike `restart`).
+From this point on, every push to `master` deploys the updated code with credentials injected automatically by the pipeline — no manual editing on the VM needed.
 
 ---
 
-## Step 11 — Configure the firewall
+## Verify Everything Works
 
-**Allow SSH through the firewall:**
-```bash
-ufw allow OpenSSH
+Hit the health check in your browser:
+
+```
+http://YOUR_BACKEND_VM_IP/health
 ```
 
-> Opens port 22 so you can continue to SSH in. Always do this before enabling ufw — if you enable ufw without allowing SSH, you'll lock yourself out.
+You should see:
 
-**Allow HTTP traffic:**
-```bash
-ufw allow 'Nginx HTTP'
+```json
+{ "status": "ok", "database": "connected" }
 ```
 
-> Opens port 80 so browsers can reach your app through Nginx.
+If you see `"database": "unreachable"` with `Access denied`, the most likely causes in order:
 
-**Enable the firewall:**
-```bash
-ufw --force enable
+1. `DB_NAME` GitHub Secret is `todo-db` instead of `tododb` — fix the secret and redeploy
+2. `DB_HOST` is wrong — must be the Cloud SQL **public IP**, not the instance name
+3. The backend VM's IP isn't in Cloud SQL's authorised networks list (Step 3)
+4. Wrong `DB_USER` or `DB_PASSWORD`
+
+Then test the API:
+
+```
+http://YOUR_BACKEND_VM_IP/api/todos
 ```
 
-> Activates ufw with the rules above. `--force` skips the "are you sure?" prompt.
+Add a new todo from the frontend, refresh the page — the todo should still be there. Unlike the in-memory version, data now persists across restarts and redeployments.
 
----
-
-## Verify Everything is Working
-
-```bash
-# Check PM2 is running the app
-pm2 list
-
-# Tail live app logs
-pm2 logs backend
-
-# Check Nginx is running
-systemctl status nginx
-
-# Test the app responds locally (should return Express output)
-curl http://localhost
-```
-
-Then open a browser and visit `http://YOUR_BACKEND_VM_IP` — you should see your Express app responding.
-
----
-
-## After Setup: Add Your .env File
-
-If your Express app needs environment variables (database URL, JWT secret, etc.), create a `.env` file on the VM:
-
-```bash
-nano /var/www/backend/.env
-```
-
-Then restart the app to pick up the new values:
-
-```bash
-sudo -u your-azure-username pm2 restart backend --update-env
-```
